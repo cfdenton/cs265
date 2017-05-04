@@ -8,7 +8,7 @@ default: main
 %.o: %.c %.h
 	$(CC) -c -o $@ $< $(CFLAGS)
 
-main: lsm_tree.o main.o 
+main: murmur3.c bloom.c lsm_tree.c main.o 
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 clean:
