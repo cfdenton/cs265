@@ -49,7 +49,6 @@ static void print_level(struct level *level);
 /*
  * init:
  * Initialization for an LSM tree-- returns NULL on failure
- * TODO: Does not yet support disk levels
  * TODO: Not yet robust against failure
  */
 struct lsm_tree *init(const char* name, int total_num, int main_num, 

@@ -3,7 +3,6 @@
 #include <ctype.h>
 #include <string.h>
 #include <unistd.h>
-#include <argp.h>
 #include <sys/time.h>
 #include "lsm_tree.h"
 
@@ -27,113 +26,135 @@
 #define DEFAULT_SIZE2 16384
 #define DEFAULT_SIZE3 65536 
 
+struct lsm_tree *lsm_tree_default_init(void);
+void interactive(struct lsm_tree *tree);
 char *get_input();
 int process_input(struct lsm_tree *tree, char *input);
 void workload(struct lsm_tree *tree, char *filename);
 void quit();
 
+/* main: process arguments and dispatch functionality */
 int main(int argc, char *argv[]) {
-    (void) argv;
-    size_t *sizes;
-    int num, num_main;
-    if (argc == 1) { /* default values */
-        sizes = (size_t *) malloc(MAX_LAYERS*sizeof(size_t));
-        sizes[0] = DEFAULT_SIZE0;
-        sizes[1] = DEFAULT_SIZE1;
-        sizes[2] = DEFAULT_SIZE2;
-        sizes[3] = DEFAULT_SIZE3;
-        num = DEFAULT_LAYERS;
-        num_main = DEFAULT_MAIN;
-    } else if (argc == 2) {
-        sizes = (size_t *) malloc(DEFAULT_LAYERS*sizeof(size_t));
-        sizes[0] = DEFAULT_SIZE0;
-        sizes[1] = DEFAULT_SIZE1;
-        sizes[2] = DEFAULT_SIZE2;
-        num = DEFAULT_LAYERS;
-        num_main = DEFAULT_MAIN;
-    } else {
-        printf("Invalid input\n");
-        exit(0);
+    /* interactive mode */
+    int iflag = 0;
+
+    /* workload mode */
+    char *wfile = NULL;
+
+    /* process arguments */
+    int c;
+    while ((c = getopt (argc, argv, "iw:")) != -1) {
+        switch (c) {
+            case 'i':
+                iflag = 1;
+                break;
+            case 'w':
+                wfile = optarg;
+                break;
+            case '?':
+                if (optopt == 'w') {
+                    fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+                } else if (isprint(optopt)) {
+                    fprintf(stderr, "Unknown option `-%c'.\n", optopt);
+                } else {
+                    fprintf(stderr, "Unknown option character `\\x%x'.\n", optopt);
+                }
+                return 1;
+            default:
+                abort();
+        }
     }
+
+    if (iflag && wfile) {
+        fprintf(stderr, "Too many arguments - try either workload or interactive mode "
+            "with -w [filename] or -i\n");
+        return 1;
+    } else if (!iflag && !wfile) {
+        fprintf(stderr, "Not enough arguments - try either workload or interactive mode "
+            "with -w [filename] or -i\n");
+    }
+
+    struct lsm_tree *tree = lsm_tree_default_init();
+
+    if (iflag) {
+        interactive(tree);
+    } else if (wfile) {
+        workload(tree, wfile);
+        quit(tree);
+    }
+    
+
+    
+
+
+
+}
+
+
+/* initialize an lsm tree with default settings */
+struct lsm_tree *lsm_tree_default_init(void) {
+    size_t *sizes = (size_t *) malloc(MAX_LAYERS*sizeof(size_t));
+    sizes[0] = DEFAULT_SIZE0;
+    sizes[1] = DEFAULT_SIZE1;
+    sizes[2] = DEFAULT_SIZE2;
+    sizes[3] = DEFAULT_SIZE3;
 
     struct timeval tval_before, tval_after, tval_result;
     printf("Initializing LSM Tree... ");
     fflush(stdout);
     gettimeofday(&tval_before, NULL);
-
-    struct lsm_tree *tree = init(DEFAULT_NAME, num, num_main, sizes);
+   
+    struct lsm_tree *tree = init(DEFAULT_NAME, DEFAULT_LAYERS, DEFAULT_MAIN, sizes);
 
     gettimeofday(&tval_after, NULL);
     timersub(&tval_after, &tval_before, &tval_result);
     printf("done.\n");
     printf("Time elapsed: %ld.%06ld\n", (long) tval_result.tv_sec, 
         (long) tval_result.tv_usec);
+   
+    free(sizes);
 
-    if (argc == 1) {
-        char *input;
-        while (1) {
-            input = get_input();
 
-            gettimeofday(&tval_before, NULL);
-            process_input(tree, input);
-            free(input);
+    return tree;
+}
 
-            gettimeofday(&tval_after, NULL);
-            timersub(&tval_after, &tval_before, &tval_result);
-            printf("Time elapsed: %ld.%06ld\n", (long) tval_result.tv_sec, 
-                (long) tval_result.tv_usec);
-        }
-    } else if (argc == 2) {
+/* use the tree in interactive mode */
+void interactive(struct lsm_tree *tree) {
+    char *input;
+    struct timeval tval_before, tval_after, tval_result;
+    while (1) {
+        input = get_input();
+        
         gettimeofday(&tval_before, NULL);
-
-        workload(tree, argv[1]);
-
+        process_input(tree, input);
+        free(input);
+        
         gettimeofday(&tval_after, NULL);
         timersub(&tval_after, &tval_before, &tval_result);
         printf("Time elapsed: %ld.%06ld\n", (long) tval_result.tv_sec, 
             (long) tval_result.tv_usec);
-        quit(tree);
     }
-    return 0;
 }
 
-char *get_input() {
-    int max = 20;
-    char* name = (char*) malloc(max); /* allocate buffer */
-    if (!name) 
-        quit();
+/* execute a workload on the tree */
+void workload(struct lsm_tree *tree, char *filename) {
+    struct timeval tval_before, tval_after, tval_result;
+    gettimeofday(&tval_before, NULL);
 
-    printf("input: ");
-
-    /* skip leading whitespace */
-    while (1) { 
-        int c = getchar();
-        if (c == EOF) break; /* end of file */
-        if (!isspace(c)) {
-             ungetc(c, stdin);
-             break;
-        }
+    assert(filename);
+    FILE *fptr = fopen(filename, "r");
+    char *buf = malloc(MAXLINE);
+    while (fgets(buf, MAXLINE, fptr)) {
+        process_input(tree, buf);
     }
 
-    int i = 0;
-    while (1) {
-        int c = getchar();
-        if (c == '\n' || c == EOF) { /* at end, add terminating zero */
-            name[i] = 0;
-            break;
-        }
-        name[i] = c;
-        if (i == max - 1) { /* buffer full */
-            max += max;
-            name = (char*) realloc(name, max); /* get a new and larger buffer */
-            if (!name) 
-                quit();
-        }
-        i++;
-    }
-    return name;
+    gettimeofday(&tval_after, NULL);
+    timersub(&tval_after, &tval_before, &tval_result);
+    printf("Time elapsed: %ld.%06ld\n", (long) tval_result.tv_sec, 
+        (long) tval_result.tv_usec);
 }
 
+/* process an update/query according to the 265 DSL */
 int process_input(struct lsm_tree *tree, char *input) {
     int args;
     char *token;
@@ -200,14 +221,48 @@ int process_input(struct lsm_tree *tree, char *input) {
     return 0;
 }
 
-void workload(struct lsm_tree *tree, char *filename) {
-    FILE *fptr = fopen(filename, "r");
-    char *buf = malloc(MAXLINE);
-    while (fgets(buf, MAXLINE, fptr)) {
-        process_input(tree, buf);
+
+/* get a line of user input (for interactive mode) */
+char *get_input() {
+    int max = 20;
+    char* name = (char*) malloc(max); /* allocate buffer */
+    if (!name) 
+        quit();
+
+    printf("input: ");
+
+    /* skip leading whitespace */
+    while (1) { 
+        int c = getchar();
+        if (c == EOF) break; /* end of file */
+        if (!isspace(c)) {
+             ungetc(c, stdin);
+             break;
+        }
     }
+
+    int i = 0;
+    while (1) {
+        int c = getchar();
+        if (c == '\n' || c == EOF) { /* at end, add terminating zero */
+            name[i] = 0;
+            break;
+        }
+        name[i] = c;
+        if (i == max - 1) { /* buffer full */
+            max += max;
+            name = (char*) realloc(name, max); /* get a new and larger buffer */
+            if (!name) 
+                quit();
+        }
+        i++;
+    }
+    return name;
 }
 
+
+
+/* quit and destroy the tree */
 void quit(struct lsm_tree *tree) {
     struct timeval tval_before, tval_after, tval_result;
     printf("Destroying LSM tree... ");
