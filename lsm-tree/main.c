@@ -38,18 +38,24 @@ int main(int argc, char *argv[]) {
     /* interactive mode */
     int iflag = 0;
 
+    /* testing bloom */
+    int bflag = 0;
+
     /* workload mode */
     char *wfile = NULL;
 
     /* process arguments */
     int c;
-    while ((c = getopt (argc, argv, "iw:")) != -1) {
+    while ((c = getopt(argc, argv, "ibw:")) != -1) {
         switch (c) {
             case 'i':
                 iflag = 1;
                 break;
             case 'w':
                 wfile = optarg;
+                break;
+            case 'b':
+                bflag = 1;
                 break;
             case '?':
                 if (optopt == 'w') {
@@ -69,25 +75,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Too many arguments - try either workload or interactive mode "
             "with -w [filename] or -i\n");
         return 1;
-    } else if (!iflag && !wfile) {
+    } else if (!iflag && !wfile && !bflag) {
         fprintf(stderr, "Not enough arguments - try either workload or interactive mode "
             "with -w [filename] or -i\n");
+        return 1;
     }
 
-    struct lsm_tree *tree = lsm_tree_default_init();
 
     if (iflag) {
+        struct lsm_tree *tree = lsm_tree_default_init();
         interactive(tree);
     } else if (wfile) {
+        struct lsm_tree *tree = lsm_tree_default_init();
         workload(tree, wfile);
         quit(tree);
+    } else if (bflag) {
+        test_bloom();        
     }
-    
-
-    
-
-
-
 }
 
 
@@ -259,8 +263,6 @@ char *get_input() {
     }
     return name;
 }
-
-
 
 /* quit and destroy the tree */
 void quit(struct lsm_tree *tree) {

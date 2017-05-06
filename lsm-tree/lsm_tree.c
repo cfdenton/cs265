@@ -7,7 +7,8 @@
 
 #include "lsm_tree.h"
 
-#define BLOOM_NUM 5
+//#define _USE_BLOOM
+#define BLOOM_NUM 2
 
 /* initialization/cleanup helper functions */
 static void main_level_init(struct lsm_tree *tree, size_t *sizes, int levelno);
@@ -18,31 +19,18 @@ static void level_destroy(struct level *level);
 static void main_level_insert(struct lsm_tree *tree, struct kv_pair *kv);
 static size_t main_level_find(struct level *level, key_t key);
 static int main_level_get(struct level *level, key_t key, struct kv_pair *res);
-static void main_level_range(struct level *level, key_t bottom, key_t top, struct kv_node **head);
 
 /* disk level operations */
 static void disk_level_insert(struct lsm_tree *tree, struct kv_pair *kv);
 static size_t disk_level_find(struct level *level, key_t key);
 static int disk_level_get(struct level *level, key_t key, struct kv_pair *res);
-static void disk_level_range(struct level *level, key_t bottom, key_t top, struct kv_node **head);
-
-/* generic operations */
-static void invalidate_kv(struct level *level, size_t pos);
-
-/* migration functions */
-static void migrate(struct lsm_tree *tree, int level);
-static void read_pair(struct level *level, size_t pos, struct kv_pair *result);
-static void write_pair(struct level *level, size_t pos, struct kv_pair *kv);
-static int valid_entry(struct level *level, size_t pos);
-static void migrate_add_kv_node(struct kv_node **head, struct kv_node **tail, struct kv_pair *kv);
-
-/* range helper functions */
-static void range_add_kv_node(struct kv_pair *kv, struct kv_node **head);
-static void range_clean_list(struct kv_node **head);
 
 /* printing */
 static void print_level(struct level *level);
 
+void *put_thread(void *arg);
+void *delete_thread(void *arg);
+void *get_thread(void *arg);
 
 /*** INITIALIZATION/CLEANUP ***/
 
@@ -106,8 +94,17 @@ static void main_level_init(struct lsm_tree *tree, size_t *sizes, int levelno) {
     level->type = MAIN_LEVEL;
     level->size = size;
     level->used = 0;
+#ifdef _USE_BTREE
+    level->bt = (struct b_tree *) malloc(sizeof(struct b_tree));
+#else
     level->m.arr = (struct kv_pair *) calloc(size, sizeof(struct kv_pair));
+#endif
+
+    pthread_mutex_init(&level->mutex, NULL);
+
+#ifdef _USE_BLOOM
     level->bloom = bloom_init(BLOOM_NUM);
+#endif
 };
 
 static void disk_level_init(struct lsm_tree *tree, size_t *sizes, int levelno) {
@@ -117,6 +114,8 @@ static void disk_level_init(struct lsm_tree *tree, size_t *sizes, int levelno) {
     level->type = DISK_LEVEL;
     level->size = size;
     level->used = 0;
+
+    pthread_mutex_init(&level->mutex, NULL);
 
     size_t buflen = 256;
     assert(buflen > strlen(tree->name) + 10);
@@ -133,15 +132,41 @@ static void disk_level_init(struct lsm_tree *tree, size_t *sizes, int levelno) {
     for (size_t i = 0; i < level->size; i++) 
         fwrite(&blank_kv, sizeof(struct kv_pair), 1, level->d.file_ptr); 
 
+#ifdef _USE_BLOOM
     level->bloom = bloom_init(BLOOM_NUM);
+#endif
 }
 
+struct arg {
+    struct lsm_tree *tree;
+    key_t key1;
+    key_t key2;
+    val_t val;
+    char *filename;
+};
+
+int put(struct lsm_tree *tree, key_t key, val_t val) {
+    struct arg *a = (struct arg *) malloc(sizeof(struct arg));
+    a->tree = tree;
+    a->key1 = key;
+    a->val = val;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, put_thread, (void *) a);
+    pthread_join(tid, NULL);
+    free(a);
+
+    return 0;
+}
 
 /* 
  * add a key-value pair to the LSM tree 
- * TODO: only supports main entry level
  */
-int put(struct lsm_tree *tree, key_t key, val_t val) {
+void *put_thread(void *arg) {
+    struct lsm_tree *tree = ((struct arg *) arg)->tree;
+    key_t key = ((struct arg *) arg)->key1;
+    val_t val = ((struct arg *) arg)->val;
+
     assert(tree->nlevels_main > 0);
     struct kv_pair kv;
     kv.key = key;
@@ -152,17 +177,34 @@ int put(struct lsm_tree *tree, key_t key, val_t val) {
     int res = 0;
 
     /* insert the new item into the now free level */
-    if (tree->levels->type == MAIN_LEVEL)
+    if (tree->levels[0].type == MAIN_LEVEL)
         main_level_insert(tree, &kv);
-    else if (tree->levels->type == DISK_LEVEL)
+    else if (tree->levels[0].type == DISK_LEVEL)
         disk_level_insert(tree, &kv);
     else 
         assert(0);
+    (void) res;
 
-    return res;
+    return NULL;
 }
 
 int delete(struct lsm_tree *tree, key_t key) {
+    struct arg *a = (struct arg *) malloc(sizeof(struct arg));
+    a->tree = tree;
+    a->key1 = key;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, delete_thread, (void *) a);
+    pthread_join(tid, NULL);
+    free(a);
+
+    return 0;
+}
+
+void *delete_thread(void *arg) {
+    struct lsm_tree *tree = ((struct arg *) arg)->tree;
+    key_t key = ((struct arg *) arg)->key1;
+
     struct kv_pair kv;
     kv.key = key;
     kv.val = 0;
@@ -176,14 +218,30 @@ int delete(struct lsm_tree *tree, key_t key) {
         disk_level_insert(tree, &kv);
     else 
         assert(0);
-    return res;
+    (void) res;
+    return NULL;
 }
 
 void get(struct lsm_tree *tree, key_t key) {
+    struct arg *a = (struct arg *) malloc(sizeof(struct arg));
+    a->tree = tree;
+    a->key1 = key;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, get_thread, (void *) a);
+    pthread_join(tid, NULL);
+    free(a);
+}
+
+void *get_thread(void *arg) {
+    struct lsm_tree *tree = ((struct arg *) arg)->tree;
+    key_t key = ((struct arg *) arg)->key1;
+
     struct kv_pair *retval = (struct kv_pair *) malloc(sizeof(struct kv_pair));
     int r;
     for (int i = 0; i < tree->nlevels; i++) {
-        assert((tree->levels + i)->type == MAIN_LEVEL || (tree->levels + i)->type == DISK_LEVEL);
+        assert((tree->levels + i)->type == MAIN_LEVEL 
+            || (tree->levels + i)->type == DISK_LEVEL);
         if ((tree->levels + i)->type == MAIN_LEVEL) {
             r = main_level_get(tree->levels + i, key, retval);
         } else {
@@ -203,6 +261,7 @@ void get(struct lsm_tree *tree, key_t key) {
             printf("\n");
             break;
     }
+    return NULL;
 }
 
 void range(struct lsm_tree *tree, key_t bottom, key_t top) {
@@ -264,7 +323,19 @@ void stat(struct lsm_tree *tree) {
 
 
 /* MAIN LEVEL OPERATIONS */
+
+/* 
+ * find a key pair on a main-memory level. Returns GET_SUCCESS on success
+ * and sets res, and otherwise returns GET_FAIL
+ */
 static int main_level_get(struct level *level, key_t key, struct kv_pair *res) {
+#ifdef _USE_BLOOM
+    /* check the bloom filter first */
+    if (bloom_check(level->bloom, key) == BLOOM_NOTFOUND) {
+        return GET_FAIL;
+    } 
+#endif
+
     size_t pos = main_level_find(level, key);
     if (level->m.arr[pos].key == key && level->m.arr[pos].valid == KV_VALID) {
         *res = level->m.arr[pos];
@@ -273,7 +344,17 @@ static int main_level_get(struct level *level, key_t key, struct kv_pair *res) {
     return GET_FAIL;
 }
 
+/* 
+ * find a key pair on a disk level. Returns GET_SUCCESS on success
+ * and sets res, and otherwise returns GET_FAIL
+ */
 static int disk_level_get(struct level *level, key_t key, struct kv_pair *res) {
+#ifdef _USE_BLOOM    
+    if (bloom_check(level->bloom, key) == BLOOM_NOTFOUND) {
+        return GET_FAIL;
+    } 
+#endif
+
     size_t pos = disk_level_find(level, key);
     struct kv_pair kv;
     fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
@@ -285,83 +366,111 @@ static int disk_level_get(struct level *level, key_t key, struct kv_pair *res) {
     return GET_FAIL;
 }
 
+
+/* 
+ * insert a key-value pair in a main-memory level
+ */
 static void main_level_insert(struct lsm_tree *tree, struct kv_pair *kv) {
     struct level *level = tree->levels;
     assert(level->type == MAIN_LEVEL);
 
-    if (level->used == level->size) 
-            migrate(tree, 0);
+    /* migrate if necessary */
+    if (level->used == level->size) {
+        migrate(tree, 0);
+    }
 
+    pthread_mutex_lock(&level->mutex);
+    /* find the position to insert this key */
     size_t pos = main_level_find(level, kv->key);
 
+    /* case 1: the key does not yet exist in this level */
     if ((level->m.arr[pos].key != kv->key && level->m.arr[pos].valid == KV_VALID) 
-            || level->m.arr[pos].valid == KV_INVAL) 
-    {
-        memmove(level->m.arr+pos+1, level->m.arr+pos, (level->size-pos-1)*sizeof(struct kv_pair));
+            || level->m.arr[pos].valid == KV_INVAL) {
+
+        memmove(level->m.arr+pos+1, level->m.arr+pos, 
+            (level->size-pos-1)*sizeof(struct kv_pair));
         level->m.arr[pos] = *kv;
         level->m.arr[pos].valid = KV_VALID;
         level->used++;
-    } else if (level->m.arr[pos].key == kv->key && level->m.arr[pos].valid == KV_VALID
-            && kv->op == OP_ADD) 
-    {
+
+    /* case 2: the key exists, so we update it */
+    } else if (level->m.arr[pos].key == kv->key && level->m.arr[pos].valid == KV_VALID) {
         level->m.arr[pos] = *kv;
-        level->m.arr[pos].valid = KV_VALID;
-    } else if (level->m.arr[pos].key == kv->key && level->m.arr[pos].valid == KV_VALID 
+    } 
+
+    /* if this is the last level and we're deleting, get rid of this */
+    if (level->m.arr[pos].key == kv->key && level->m.arr[pos].valid == KV_VALID 
             && kv->op == OP_DEL) {
-        memmove(level->m.arr+pos, level->m.arr+pos+1, (level->size-pos)*sizeof(struct kv_pair));
+        memmove(level->m.arr+pos, level->m.arr+pos+1, 
+            (level->size-pos)*sizeof(struct kv_pair));
         invalidate_kv(level, level->size-1);
         level->used--;
     }
+
+#ifdef _USE_BLOOM
+    /* add to the bloom filter */
+    bloom_add(level->bloom, kv->key);
+#endif
+    pthread_mutex_unlock(&level->mutex);
 }
 
+
+/* 
+ * this function  may actually work, but there's no reason we should use it,
+ * so ignore it for now
+ */
 static void disk_level_insert(struct lsm_tree *tree, struct kv_pair *kv) {
-    struct level *level = tree->levels;
-    assert(level->type == DISK_LEVEL);
-    
-    if (level->used == level->size)
-        migrate(tree, 0);
-    
-    size_t pos = disk_level_find(level, kv->key);
+    (void) tree; (void) kv;
+    //struct level *level = tree->levels;
+    //assert(level->type == DISK_LEVEL);
+    //
+    //if (level->used == level->size)
+    //    migrate(tree, 0);
+    //
+    //size_t pos = disk_level_find(level, kv->key);
 
-    /* read the kv_pair stored at position pos */
-    struct kv_pair disk_kv, copy_kv, new_kv;
-    fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
-    fread(&disk_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    ///* read the kv_pair stored at position pos */
+    //struct kv_pair disk_kv, copy_kv, new_kv;
+    //fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
+    //fread(&disk_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
 
-    if ((disk_kv.key != kv->key && disk_kv.valid == KV_VALID) || disk_kv.valid == KV_INVAL) {
-        /* memmove */        
-        for (size_t i = 0; i < level->size-pos-1; i++) {
-            fread(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-            fwrite(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-            fseek(level->d.file_ptr, -(long) sizeof(struct kv_pair), SEEK_CUR);
-        }
-        /* write the new kv */
-        new_kv = *kv;
-        new_kv.valid = KV_VALID;
-        fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
-        fwrite(&new_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-        level->used++;
-    } else if (disk_kv.key == kv->key && disk_kv.valid == KV_VALID && kv->op == OP_ADD) {
-        /* write the new kv */
-        new_kv = *kv;
-        new_kv.valid = KV_VALID;
-        fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
-        fwrite(&new_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-    } else if (disk_kv.key == kv->key && disk_kv.valid == KV_VALID && kv->op == OP_DEL) {
-        /* memmove */
-        for (size_t i = 0; i < level->size-pos-1; i++) {
-            fread(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-            fseek(level->d.file_ptr, -(long) sizeof(struct kv_pair), SEEK_CUR);
-            fwrite(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-            fseek(level->d.file_ptr, sizeof(struct kv_pair), SEEK_CUR);
-        }
-        /* write a blank kv at the end */
-        invalidate_kv(level, level->size-1);
-        level->used--;
-    }
+    //if ((disk_kv.key != kv->key && disk_kv.valid == KV_VALID) || disk_kv.valid == KV_INVAL) {
+    //    /* memmove */        
+    //    for (size_t i = 0; i < level->size-pos-1; i++) {
+    //        fread(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //        fwrite(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //        fseek(level->d.file_ptr, -(long) sizeof(struct kv_pair), SEEK_CUR);
+    //    }
+    //    /* write the new kv */
+    //    new_kv = *kv;
+    //    new_kv.valid = KV_VALID;
+    //    fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
+    //    fwrite(&new_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //    level->used++;
+    //} else if (disk_kv.key == kv->key && disk_kv.valid == KV_VALID && kv->op == OP_ADD) {
+    //    /* write the new kv */
+    //    new_kv = *kv;
+    //    new_kv.valid = KV_VALID;
+    //    fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
+    //    fwrite(&new_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //} else if (disk_kv.key == kv->key && disk_kv.valid == KV_VALID && kv->op == OP_DEL) {
+    //    /* memmove */
+    //    for (size_t i = 0; i < level->size-pos-1; i++) {
+    //        fread(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //        fseek(level->d.file_ptr, -(long) sizeof(struct kv_pair), SEEK_CUR);
+    //        fwrite(&copy_kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
+    //        fseek(level->d.file_ptr, sizeof(struct kv_pair), SEEK_CUR);
+    //    }
+    //    /* write a blank kv at the end */
+    //    invalidate_kv(level, level->size-1);
+    //    level->used--;
+    //}
 }
 
-/* do binary search on a sorted array */
+
+/* do binary search on a sorted array in main memory. Assumes 
+ * that the level lock is held
+ */
 static size_t main_level_find(struct level *level, key_t key) {
     assert(level->type == MAIN_LEVEL);
     size_t bottom = 0;
@@ -380,6 +489,7 @@ static size_t main_level_find(struct level *level, key_t key) {
     return bottom;
 }
 
+/* do binary search on a sorted array on disk */
 static size_t disk_level_find(struct level *level, key_t key) {
     assert(level->type == DISK_LEVEL);
     size_t bottom = 0;
@@ -402,206 +512,7 @@ static size_t disk_level_find(struct level *level, key_t key) {
 }
 
 
-static void main_level_range(struct level *level, key_t bottom, key_t top, struct kv_node **head) {
-    for (size_t i = 0; i < level->used; i++) {
-        if (level->m.arr[i].key > bottom && level->m.arr[i].key < top) {
-            if (level->m.arr[i].valid)
-                range_add_kv_node(level->m.arr + i, head);
-        }
-    }
-}
-
-static void disk_level_range(struct level *level, key_t bottom, key_t top, struct kv_node **head) {
-    struct kv_pair kv;
-    fseek(level->d.file_ptr, 0, SEEK_SET);
-    for (size_t i = 0; i < level->used; i++) {
-        fread(&kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-        if (kv.key > bottom && kv.key < top) {
-            if (kv.valid)
-                range_add_kv_node(&kv, head);
-        }
-    }
-}
-
-static void range_add_kv_node(struct kv_pair *kv, struct kv_node **head) {
-    int add = 1;
-    struct kv_node *last_node = NULL;
-    struct kv_node *cur_node = *head;
-    while (cur_node) {
-        if (cur_node->kv.key == kv->key) 
-            add = 0;
-        last_node = cur_node;
-        cur_node = cur_node->next_node;
-    }
-
-    if (add) {
-        struct kv_node *new_node = (struct kv_node *) malloc(sizeof(struct kv_node));
-        new_node->kv = *kv;
-        new_node->next_node = NULL;
-        if (*head) 
-            last_node->next_node = new_node;
-        else
-            *head = new_node;
-    }
-}
-
-static void range_clean_list(struct kv_node **head) {
-    struct kv_node *last_node = NULL;
-    struct kv_node *cur_node = *head;
-    while (cur_node) {
-        if (cur_node->kv.op == OP_DEL) {
-            if (last_node) 
-                last_node->next_node = cur_node->next_node;
-            else if (*head == cur_node)
-                *head = cur_node->next_node;
-            free(cur_node);
-            if (last_node)
-                cur_node = last_node->next_node;
-            else
-                cur_node = NULL;
-        }
-        else {
-            last_node = cur_node;
-            cur_node = cur_node->next_node;
-        }
-    }
-}
-
-/* MIGRATION */
-
-// TODO: make sure this is correct
-static void migrate(struct lsm_tree *tree, int top) {
-    assert(top < tree->nlevels-1);
-
-    // get levels in question 
-    struct level *top_level = tree->levels + top;
-    struct level *bottom_level = tree->levels + top + 1;
-
-    size_t top_read = 0;
-    size_t bottom_read = 0;
-    size_t bottom_write = 0;
-    struct kv_pair *next_top = (struct kv_pair *) malloc(sizeof(struct kv_pair));
-    struct kv_pair *next_bottom = (struct kv_pair *) malloc(sizeof(struct kv_pair));
-    struct kv_node *list_head = NULL;
-    struct kv_node *next_head = NULL;
-    struct kv_node *list_tail = NULL;
-    bottom_level->used = 0;
-
-    /* read entries until the top has been exhausted and we have nothing left to write */
-    while (top_read < top_level->size || list_head) {
-
-        /* migrate another level if necessary */
-        if (bottom_level->used == bottom_level->size) {
-            migrate(tree, top+1);
-            bottom_read = 0;
-            bottom_write = 0;
-        } else if (bottom_write == bottom_level->size) {
-            /* lowest level of the tree is full, crash */
-            // TODO: handle this more gracefully
-            assert(0);
-        }
-
-        /* try to write something */
-        if (!valid_entry(bottom_level, bottom_write) && list_head) {
-            /* write a key-value pair */
-            write_pair(bottom_level, bottom_write, &(list_head->kv));
-
-            /* update the head */
-            next_head = list_head->next_node;
-            free(list_head);
-            list_head = next_head;
-            if (!list_head)
-                list_tail = list_head;
-
-            /* update the write position */
-            bottom_write++;
-            bottom_level->used++;
-            if (bottom_read < bottom_write)
-                bottom_read = bottom_write;
-
-        } 
-        /* we can't write anything, so read something */
-        else {
-            /* read a pair of the top level */
-            if (top_read < top_level->size) {
-                read_pair(top_level, top_read, next_top);
-            } else
-                next_top = NULL;
-
-            /* read a pair of the bottom level */
-            if (bottom_read < bottom_level->size) {
-                read_pair(bottom_level, bottom_read, next_bottom);
-            } else 
-                next_bottom = NULL;
-
-
-            /* process what we just read */
-
-            /* neither of the two options is valid, break */
-            if ((!next_top || !next_top->valid) && (!next_bottom || !next_bottom->valid)) {
-                break;
-            }
-
-            /* only the top is valid, add it to the queue */
-            else if (!next_bottom || !next_bottom->valid) {
-                migrate_add_kv_node(&list_head, &list_tail, next_top);
-                invalidate_kv(top_level, top_read);
-                top_read++;
-            }
-
-            /* only the bottom is valid, add it to the queue */
-            else if (!next_top || !next_top->valid) {
-                migrate_add_kv_node(&list_head, &list_tail, next_bottom);
-                invalidate_kv(bottom_level, bottom_read);
-                bottom_read++;
-            } 
-
-            /* the top is better, take that */
-            else if (next_top->key < next_bottom->key) {
-                migrate_add_kv_node(&list_head, &list_tail, next_top);
-                invalidate_kv(top_level, top_read);
-                top_read++;
-            } 
-
-            /* the bottom is better, take that */
-            else if (next_top->key > next_bottom->key) {
-                migrate_add_kv_node(&list_head, &list_tail, next_bottom);
-                invalidate_kv(bottom_level, bottom_read);
-                bottom_read++;
-            } 
-
-            /* the keys are equal and the top is an add, so take that */
-            else if (next_top->op == OP_ADD || top < tree->nlevels - 2) {
-                // take the top and ignore the bottom
-                migrate_add_kv_node(&list_head, &list_tail, next_top);
-                invalidate_kv(top_level, top_read);
-                invalidate_kv(bottom_level, bottom_read);
-                top_read++;
-                bottom_read++;
-            } 
-
-            /* the keys are equal and the top is a delete, so ignore both */
-            else if (next_top->op == OP_DEL && top == tree->nlevels - 1) {
-                // take neither, invalidate both
-                invalidate_kv(top_level, top_read);
-                invalidate_kv(bottom_level, bottom_read);
-                top_read++;
-                bottom_read++;
-            } else 
-                assert(0);
-        }
-    }
-    /* free our allocations */
-    free(next_top);
-    free(next_bottom);
-
-    /* top is now empty */
-    top_level->used = 0;
-    assert(bottom_level->used == bottom_write);
-}
-
-/* read a pair at a certain position into a preallocated kv_pair struct */
-static void read_pair(struct level *level, size_t pos, struct kv_pair *result) {
+void read_pair(struct level *level, size_t pos, struct kv_pair *result) {
     assert(pos < level->size);
     if (level->type == MAIN_LEVEL) {
         *result = level->m.arr[pos];
@@ -611,45 +522,8 @@ static void read_pair(struct level *level, size_t pos, struct kv_pair *result) {
     }
 }
 
-/* write a pair at a certain position */
-static void write_pair(struct level *level, size_t pos, struct kv_pair *kv) {
-    assert(pos < level->size);
-    if (level->type == MAIN_LEVEL) {
-        level->m.arr[pos] = *kv;
-        level->m.arr[pos].valid = KV_VALID;
-    } else if (level->type == DISK_LEVEL) {
-        fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
-        fwrite(kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-    }
-}
 
-/* check if a given entry is valid */
-static int valid_entry(struct level *level, size_t pos) {
-    if (level->type == MAIN_LEVEL) {
-        return level->m.arr[pos].valid;
-    } else if (level->type == DISK_LEVEL) {
-        struct kv_pair kv;
-        fseek(level->d.file_ptr, pos*sizeof(struct kv_pair), SEEK_SET);
-        fread(&kv, sizeof(struct kv_pair), 1, level->d.file_ptr);
-        return kv.valid;
-    }
-    assert(0);
-    return 0;
-}
-
-static void migrate_add_kv_node(struct kv_node **head, struct kv_node **tail, struct kv_pair *kv) {
-    struct kv_node *next_tail;
-    next_tail = (struct kv_node *) malloc(sizeof(struct kv_node));
-    next_tail->next_node = NULL;
-    next_tail->kv = *kv;
-    if (*tail)
-        (*tail)->next_node = next_tail;
-    *tail = next_tail;
-    if (!*head)
-        *head = *tail;
-}
-
-static void invalidate_kv(struct level *level, size_t pos) {
+void invalidate_kv(struct level *level, size_t pos) {
     if (level->type == MAIN_LEVEL) {
         level->m.arr[pos].key = 0;
         level->m.arr[pos].val = 0;
@@ -677,12 +551,13 @@ static void level_destroy(struct level *level) {
         remove(level->d.filename);
         free(level->d.filename);
     }
+#ifdef _USE_BLOOM
+    bloom_destroy(level->bloom);
+#endif
 }
 
 
 /* PRINTING */
-
-
 void print_tree(struct lsm_tree *tree) {
     for (int i = 0; i < tree->nlevels; i++) {
         print_level(tree->levels + i);
